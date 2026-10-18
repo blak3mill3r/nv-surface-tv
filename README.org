@@ -1,0 +1,106 @@
+#+title: nv-surface-tv
+#+filetags: project
+
+Live top-screen -> minidlna, as a *.ts* item that is really a fifo.
+
+When your TV opens the item, ffmpeg grabs the top screen, encodes 1080p10
+H.264 MPEG-TS with NVENC at a low bitrate, and feeds it through the fifo to
+minidlna. When no client is reading, nothing expensive runs (no grab, no
+encode).
+
+* Install
+
+Run once as root to build/install the shim, adjust minidlna, and create the
+fifo:
+
+#+begin_src sh
+  cd ~/w/nv-surface-tv
+  sudo ./nv-surface-tv.sh setup
+#+end_src
+
+=setup= restarts minidlna briefly (it must re-index a real placeholder before
+we swap it for the fifo), so run it when nothing is being watched over DLNA.
+
+Then install the always-on user service:
+
+#+begin_src sh
+  ./nv-surface-tv.sh install-service
+#+end_src
+
+That writes and enables =~/.config/systemd/user/nv-surface-tv.service= and
+starts it.
+
+* Use
+
+On the TV, browse minidlna's Video/Folders and play =00-LiveCapture.ts= (it
+sorts first). It streams the top screen until you stop playback.
+
+* Manage the service
+
+#+begin_src sh
+  systemctl --user status nv-surface-tv
+  systemctl --user stop nv-surface-tv
+  systemctl --user start nv-surface-tv
+  journalctl --user -u nv-surface-tv -f
+  ./nv-surface-tv.sh status
+#+end_src
+
+=Restart=always= keeps the loop alive. The loop self-heals across boot and
+drive mounts: it waits for the fifo and the X display, and only starts ffmpeg
+when a reader is actually present.
+
+* How it works
+
+- The item =00-LiveCapture.ts= in minidlna's media dir is a fifo, created by
+  =setup= after minidlna indexes a real placeholder of the same name.
+- minidlna 1.3.0 can't stream a fifo out of the box: it uses =sendfile64()=,
+  which fails on fifos, and it sizes the response with =lseek(SEEK_END)=.
+  The =LD_PRELOAD= shim (=fifo-lseek-shim.c=) makes those calls, for fifo fds
+  only, behave so minidlna falls back to its read/write path.
+- A small helper (=fifo-watch.c=) blocks on the fifo's write end. When a
+  reader opens the fifo it prints =up=; when the last reader closes it it
+  prints =down=. No polling, no privileges.
+- The loop reacts to those events: =up= starts ffmpeg, =down= kills it. This
+  is how the capture stays off until the TV actually connects.
+
+Idle cost: one blocking watcher process and one sleeping bash loop, ~0 CPU.
+No encoding.
+
+* Config
+
+All knobs are at the top of =nv-surface-tv.sh=:
+
+| Variable              | Default             | Meaning                                                |
+|-----------------------+---------------------+--------------------------------------------------------|
+| =MEDIA_DIR=           | =/big1/movies=      | minidlna media_dir                                     |
+| =ITEM_NAME=           | =00-LiveCapture.ts= | sorts first in the listing                             |
+| =SCREEN_DISPLAY=      | =:0=                | X display                                              |
+| =SCREEN_GEOMETRY=     | =3840x2160=         | top screen (DP-0)                                      |
+| =OUT_WIDTH/HEIGHT=    | =1920x1080=         | streamed resolution                                    |
+| =FPS=                 | =10=                | streamed frame rate (kept low for TV stability)        |
+| =VIDEO_BITRATE=       | =2M=                | NVENC CBR bitrate                                      |
+| =VIDEO_BUFSIZE=       | =4M=                | NVENC VBV buffer                                       |
+| =AUDIO_ENABLED=       | =1=                 | capture system audio output                            |
+| =AUDIO_MONITOR=       | =(auto)=            | default sink's monitor; override with an explicit node |
+| =AUDIO_BITRATE=       | =160k=              | AAC audio bitrate                                      |
+| =MAX_SESSION_SECONDS= | =0= (unlimited)     | per-session cap                                        |
+| =PLACEHOLDER_SECONDS= | =7200=              | fake duration the TV browses (2h)                      |
+
+* Caveats
+
+- =setup= sets =inotify=no= in =/etc/minidlna.conf=. minidlna no longer
+  auto-detects new media; add new movies with =sudo systemctl restart minidlna=.
+  The live item survives a restart (verified).
+- A minidlna restart briefly opens the fifo to probe it, which can trigger a
+  ~1s spurious ffmpeg start. Harmless.
+- Some TVs show a "file may be corrupt" error on the first open of the fifo;
+  playing it a second time has worked.
+- Audio is the DEFAULT SINK's MONITOR (system output). The headset MIC is
+  never captured -- capturing the default source instead would broadcast
+  your own voice back to the TV as an echo.
+  If the audio server is unreachable at stream start, ffmpeg falls back to a
+  silent AAC track.
+- Latency is bounded by trimming the muxer (=muxdelay 0= =muxpreload 0=) and
+  by keeping the stream light (10 fps / 2 Mbps) so the TV doesn't stall and
+  fall behind. The TV still buffers, so a long session may still drift --
+  restart playback on the TV to snap back to the live edge.
